@@ -1,0 +1,11 @@
+language: ruby
+rvm:
+  - "2.1.8"
+  - "2.2.4"
+  - "2.3.0"
+  #- rbx
+sudo: required
+dist: trusty
+install: ./travis/install-dependencies.sh
+before_script: ./travis/clear-port-53.sh
+script: bundle exec rspec spec

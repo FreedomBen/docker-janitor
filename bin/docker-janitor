@@ -1,0 +1,238 @@
+#!/usr/bin/env ruby
+
+require 'thor'
+require 'sys/filesystem'
+require 'ostruct'
+require 'colorize'
+
+require 'docker_janitor'
+
+class DockerJanitorBin < Thor
+  class_option :dryrun, type: :boolean, aliases: ['dry-run', 'd'], default: false
+
+  desc 'clean', 'Clean up leftover docker cruft (does containers, images, volumes)'
+  long_desc <<-LONGDESC
+    Clean up leftover docker cruft
+
+    This command will clean up the saved cache items that docker
+    fills up your disk with.  This includes containers that have
+    exited, images that are unlabeled, and old volumes.
+
+    To restrict what is cleaned up, you can specify [-c|--containers],
+    [-i|--images], and/or [-v|--volumes].  If nothing is specified,
+    all three will be cleaned.
+
+    Named volumes are not included by default to avoid data loss.
+    If you want to include them, pass --include-named or -n or --named
+
+    > $ docker-janitor [-c|--containers] [-i|--images] [-v|--volumes]
+  LONGDESC
+  option :containers, type: :boolean, aliases: ['c', 'container'], default: false
+  option :images, type: :boolean, aliases: ['i', 'image'], default: false
+  option :volumes, type: :boolean, aliases: ['v', 'volumes'], default: false
+  option :'include-named', type: :boolean, aliases: ['n', 'named'], default: false
+  def clean
+    args = options.dup
+    if !args[:containers] && !args[:images] && !args[:volumes]
+      args[:containers] = true
+      args[:images]     = true
+      args[:volumes]    = true
+    end
+    exec_clean(args)
+  end
+
+  desc 'containers', 'Delete exited containers'
+  def containers
+    exec_clean({
+      dryrun: options[:dryrun],
+      containers: true,
+      images: false,
+      volumes: false
+    })
+  end
+
+  desc 'images', 'Delete unlabeled imaged'
+  def images
+    exec_clean({
+      dryrun: options[:dryrun],
+      containers: false,
+      images: true,
+      volumes: false
+    })
+  end
+
+  desc 'volumes', 'Delete orphaned volumes'
+  def volumes
+    exec_clean({
+      dryrun: options[:dryrun],
+      containers: false,
+      images: false,
+      volumes: true
+    })
+  end
+
+  desc 'config-file', 'Write a default config file'
+  long_desc <<-LONGDESC
+    Writes a dory config file to #{DockerJanitor::Config.filename}
+    containing the default settings.  This can then be configured
+    as preferred.
+  LONGDESC
+  def config_file
+    exec_config_file(options)
+  end
+
+  private
+
+  def exec_clean(options)
+    mounts = Sys::Filesystem.mounts.select do |m|
+      %w[ntfs vfat xfs].include?(m) ||
+      m.mount_type =~ /^ext[234]$/i ||
+      m.mount_type =~ /^reiser/i
+    end
+    mounts.map! do |m|
+      OpenStruct.new({
+        mount: m,
+        mbfree: mb_free(m.mount_point)
+      })
+    end
+
+    if options[:containers]
+      puts "[*] Deleting stopped containers".cyan
+      containers = DockerJanitor::Sh.run_command(
+        "docker ps -a | grep -E 'Exited|Created'"
+      ).stdout.split("\n")
+      puts "[*] #{containers.count} containers to delete".green
+      containers.each do |cont|
+        id_sha, image, command, created, status, ports, name = cont.split(/\s{2,}/)
+        unless name
+          name = ports
+          ports = ''
+        end
+        if options[:dryrun]
+          puts "[*] Not actually deleting containers (dry run)".yellow
+        else
+          if DockerJanitor::Config.settings[:safe_containers].any?{ |safe_container|
+            name   =~ /#{safe_container}/ ||
+            id_sha =~ /#{safe_container}/ ||
+            image  =~ /#{safe_container}/
+          }
+            puts "[*] Container '#{name}' with ID '#{id_sha}' is protected.  " \
+                 "Not deleting.".yellow
+          else
+            puts "[*] Deleting container '#{name}' with ID '#{id_sha}' created #{created}...".blue
+            unless DockerJanitor::Sh.run_command("docker rm #{id_sha}").success?
+              puts "[*] Failed deleting container '#{name}' with ID " \
+                   "'#{id_sha}' with command '#{command}' created " \
+                   "#{created}.  Status: '#{status}'".red
+            end
+          end
+        end
+      end
+    end
+
+    if options[:images]
+      puts "[*] Deleting all unlabeled images".cyan
+      to_del = DockerJanitor::Sh.run_command(
+        "docker images | grep -iE '^<none>' | awk '{print $3}'"
+      ).stdout.split("\n")
+      puts "[*] #{to_del.count} images to delete".green
+      puts "[*] #{to_del.join(' ')}".blue
+      if to_del.empty?
+        puts "[*] No unlabeled images to delete!".green
+      else
+        if options[:dryrun]
+          puts "[*] Not actually deleting images (dry run)".yellow
+        else
+          if del_images.success?
+            puts "[*] Unlabeled images successfully delete".green
+          else
+            puts "[*] Error deleting unlabeled images".red
+          end
+        end
+      end
+    end
+
+    if options[:volumes]
+      puts "[*] Deleting all dangling docker volumes".cyan
+      if options[:'include-named']
+        command = 'docker volume ls -qf dangling=true'
+      else
+        command = "docker volume ls -qf dangling=true | grep -E --color=none '^[A-Fa-f0-9]{64}$'"
+      end
+      volumes = DockerJanitor::Sh.run_command(command).stdout.split("\n")
+      if volumes.empty?
+        puts "[*] No dangling volumes to delete!".green
+      else
+        puts "[*] Removing these volumes:".green
+        volumes.each{ |v| puts v.blue }
+        if options[:dryrun]
+          puts "[*] Not actually deleting volumes (dry run)".yellow
+        else
+          if del_volumes(volumes).success?
+            puts "[*] Succeeded removing dangling volumes".green
+          else
+            puts "[*] Error removing dangling volumes".red
+          end
+        end
+      end
+    end
+
+    puts "Mount Name:\tMount Point:\tFree Before:\tFree After:\tTotal freed:".cyan
+    mounts.each do |m|
+      m.mount.name
+      m.mount.mount_point
+      m.mbfree
+      puts "#{m.mount.name}\t" \
+           "#{m.mount.mount_point}\t\t" \
+           "#{free_space(m.mbfree)}\t\t" \
+           "#{free_space(mb_free(m.mount.mount_point))}\t\t" \
+           "#{free_space(mb_free(m.mount.mount_point) - m.mbfree)}"
+    end
+  end
+
+  def del_images
+    DockerJanitor::Sh.run_command(
+      "docker rmi $(docker images | grep -iE '^<none>' " \
+      "| awk '{print $3}' | xargs)"
+    )
+  end
+
+  def del_volumes(volumes)
+    DockerJanitor::Sh.run_command(
+      "docker volume rm #{volumes.join(' ')}"
+    )
+  end
+
+  def free_space(megabytes)
+    if megabytes / 1024 > 9
+      "#{megabytes / 1024} GB"
+    else
+      "#{megabytes} MB"
+    end
+  end
+
+  def mb_free(mount_point)
+    Sys::Filesystem.stat(mount_point).bytes_free / 1024 / 1024
+  end
+
+  def exec_config_file(options)
+    if File.exist?(DockerJanitor::Config.filename)
+      print "A config file already exists at #{DockerJanitor::Config.filename}" \
+            ".  Overwrite with default settings? (Y/N): ".yellow
+      conf = STDIN.gets.chomp
+      unless conf =~ /y/i
+        puts "User declined over-writing.  Not writing config file".red
+        return
+      end
+    end
+    puts "Writing config file to #{DockerJanitor::Config.filename}".green
+    DockerJanitor::Config.write_default_settings_file
+  end
+
+end
+
+if !ARGV.empty? && %w[-v --version].include?(ARGV.first)
+  puts "Docker Janitor - Version: #{DockerJanitor::VERSION}"
+else
+  DockerJanitorBin.start(ARGV)
+end

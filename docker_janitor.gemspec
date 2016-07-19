@@ -6,7 +6,7 @@ require 'docker_janitor/version'
 Gem::Specification.new do |s|
   s.name        = 'docker_janitor'
   s.version     = DockerJanitor::VERSION
-  s.date        = '2016-07-06'
+  s.date        = '2016-07-19'
   s.summary     = 'docker janitor helps you clean up after the' \
     ' sometimes messy house guest known as docker'
   s.description = 'The slack web api is good, but very raw.  '

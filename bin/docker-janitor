@@ -111,7 +111,7 @@ class DockerJanitorBin < Thor
         if options[:dryrun]
           puts "[*] Not actually deleting containers (dry run)".yellow
         else
-          if DockerJanitor::Config.settings[:safe_containers].any?{ |safe_container|
+          if DockerJanitor::Config.settings[:"docker-janitor"][:safe_containers].any?{ |safe_container|
             name   =~ /#{safe_container}/ ||
             id_sha =~ /#{safe_container}/ ||
             image  =~ /#{safe_container}/

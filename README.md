@@ -24,6 +24,7 @@ Then run it!
 ```
 Commands:
   docker-janitor clean           # Clean up leftover docker cruft (does containers, images, volumes)
+  docker-janitor config-file     # Write a default config file
   docker-janitor containers      # Delete exited containers
   docker-janitor help [COMMAND]  # Describe available commands or one specific command
   docker-janitor images          # Delete unlabeled imaged
